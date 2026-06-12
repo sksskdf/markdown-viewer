@@ -1,0 +1,674 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="theme-color" content="#ffffff">
+<title>MD Viewer</title>
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="favicon.ico">
+<link rel="apple-touch-icon" href="icon-192.png">
+<style>
+  :root {
+    --bg: #ffffff;
+    --fg: #1a1a1a;
+    --muted: #8a8a8a;
+    --line: #ececec;
+    --code-bg: #f6f6f6;
+    --accent: #3b6ef6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161616;
+      --fg: #e6e6e6;
+      --muted: #7d7d7d;
+      --line: #2a2a2a;
+      --code-bg: #1f1f1f;
+      --accent: #6f93ff;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; height: 100%; }
+  /* hidden 속성이 어떤 display 규칙도 이기도록 — 빈 상태가 안 사라지던 버그 방지 */
+  [hidden] { display: none !important; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: Pretendard, -apple-system, "Segoe UI", "Malgun Gothic", sans-serif;
+    line-height: 1.7;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* ── 헤더 (한 줄, 두 상태) ── */
+  header {
+    position: sticky;
+    top: 0;
+    z-index: 5;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    height: 52px;
+    padding: 0 14px;
+    background: color-mix(in srgb, var(--bg) 85%, transparent);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--line);
+  }
+  .wordmark { font-size: 14px; font-weight: 600; color: var(--muted); padding-left: 6px; }
+
+  /* 탭 스트립 */
+  .tabs {
+    display: flex;
+    align-items: stretch;
+    gap: 1px;
+    flex: 1;
+    min-width: 0;
+    height: 100%;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .tabs::-webkit-scrollbar { display: none; }
+  .tabs.overflow {
+    -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 28px), transparent);
+    mask-image: linear-gradient(to right, #000 calc(100% - 28px), transparent);
+  }
+  .tab {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 0 6px 0 11px;
+    font-size: 13px;
+    color: var(--muted);
+    border-bottom: 2px solid transparent;
+    cursor: pointer;
+    white-space: nowrap;
+    user-select: none;
+    flex: 0 0 auto;
+  }
+  .tab:hover { color: var(--fg); }
+  .tab.active { color: var(--fg); border-bottom-color: var(--accent); }
+  .tab .label { overflow: hidden; text-overflow: ellipsis; max-width: 150px; }
+  .tab .aff { width: 16px; height: 16px; display: inline-flex; align-items: center; justify-content: center; flex: none; }
+  .tab .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); display: none; }
+  .tab.dirty .dot { display: block; }
+  .tab .close {
+    display: none; width: 16px; height: 16px; padding: 0; border: none; border-radius: 4px;
+    align-items: center; justify-content: center; font-size: 15px; line-height: 1;
+    background: transparent; color: var(--muted); cursor: pointer;
+  }
+  .tab:hover .dot, .tab:focus-within .dot { display: none; }
+  .tab:hover .close, .tab:focus-within .close { display: inline-flex; }
+  .tab .close:hover { background: var(--code-bg); color: var(--fg); }
+
+  /* 오른쪽 고정 컨트롤 */
+  .controls { display: flex; align-items: center; gap: 8px; flex: none; margin-left: auto; }
+  .segmented { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .segmented button { appearance: none; border: none; background: transparent; color: var(--muted); font: inherit; font-size: 12px; padding: 5px 12px; cursor: pointer; }
+  .segmented button.active { background: var(--code-bg); color: var(--fg); }
+  .open-btn { appearance: none; border: 1px solid var(--line); background: transparent; color: var(--fg); font: inherit; font-size: 13px; padding: 6px 14px; border-radius: 8px; cursor: pointer; }
+  .open-btn:hover { border-color: var(--muted); }
+
+  /* ── 본문 ── */
+  main { max-width: 720px; margin: 0 auto; padding: 44px 24px 120px; }
+
+  /* 편집 textarea — '폼'이 아니라 '글 위의 커서'처럼 */
+  #editor {
+    display: block;
+    width: 100%;
+    min-height: calc(100vh - 180px);
+    border: none;
+    outline: none;
+    resize: none;
+    background: transparent;
+    color: var(--fg);
+    font-family: "JetBrains Mono", Consolas, monospace;
+    font-size: 14px;
+    line-height: 1.75;
+    tab-size: 4;
+    padding: 0;
+  }
+
+  /* ── 빈 화면 ── */
+  #empty {
+    min-height: calc(100vh - 52px);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    color: var(--muted);
+    font-size: 15px;
+    user-select: none;
+  }
+  #empty .icon { font-size: 40px; opacity: .5; }
+  #empty .hint { font-size: 13px; transition: color .2s; }
+
+  /* ── 드래그 오버레이 ── */
+  body.dragging::after {
+    content: "놓으면 열립니다";
+    position: fixed;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 18px;
+    color: var(--accent);
+    background: color-mix(in srgb, var(--bg) 80%, transparent);
+    border: 2px dashed var(--accent);
+    z-index: 50;
+  }
+
+  /* ── 마크다운 렌더링 ── */
+  #content h1, #content h2, #content h3 { line-height: 1.4; margin: 2em 0 .6em; font-weight: 650; }
+  #content h1 { font-size: 1.7em; margin-top: 0; }
+  #content h2 { font-size: 1.35em; padding-bottom: .3em; border-bottom: 1px solid var(--line); }
+  #content h3 { font-size: 1.1em; }
+  #content p { margin: .9em 0; }
+  #content a { color: var(--accent); text-decoration: none; }
+  #content a:hover { text-decoration: underline; }
+  #content code { font-family: "JetBrains Mono", Consolas, monospace; font-size: .86em; background: var(--code-bg); padding: .15em .4em; border-radius: 5px; }
+  #content pre { background: var(--code-bg); padding: 16px; border-radius: 10px; overflow-x: auto; }
+  #content pre code { background: none; padding: 0; font-size: .85em; }
+  #content blockquote { margin: 1em 0; padding: .1em 1.2em; border-left: 3px solid var(--line); color: var(--muted); }
+  #content ul, #content ol { padding-left: 1.5em; }
+  #content li { margin: .3em 0; }
+  #content hr { border: none; border-top: 1px solid var(--line); margin: 2.5em 0; }
+  #content img { max-width: 100%; border-radius: 8px; }
+  #content table { border-collapse: collapse; width: 100%; margin: 1em 0; font-size: .92em; }
+  #content th, #content td { border: 1px solid var(--line); padding: 8px 12px; text-align: left; }
+  #content th { background: var(--code-bg); font-weight: 600; }
+</style>
+</head>
+<body>
+
+<header>
+  <span class="wordmark" id="wordmark">MD Viewer</span>
+  <div class="tabs" id="tabs" role="tablist" aria-label="열린 문서" hidden></div>
+  <div class="controls">
+    <div class="segmented" id="toggle" role="group" aria-label="보기 또는 편집" hidden>
+      <button data-mode="view" id="segView" aria-pressed="true">읽기</button>
+      <button data-mode="edit" id="segEdit" aria-pressed="false">편집</button>
+    </div>
+    <button class="open-btn" id="openBtn">열기</button>
+  </div>
+</header>
+
+<main>
+  <div id="empty">
+    <div class="icon">⌘</div>
+    <div>마크다운 파일을 끌어다 놓으세요</div>
+    <div class="hint">또는 우측 상단 [열기]</div>
+  </div>
+  <article id="content" hidden></article>
+  <textarea id="editor" spellcheck="false" hidden></textarea>
+</main>
+
+<input type="file" id="fileInput" accept=".md,.markdown,.txt,.mdown,.mkd" multiple hidden>
+
+<script>
+/* ───────────── 미니멀 마크다운 파서 (외부 의존성 없음) ───────────── */
+function md(src) {
+  const esc = s => s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;");
+  const safeUrl = u => /^\s*(javascript|data|vbscript):/i.test(u) ? "#" : u;   // 위험 스킴 차단
+  src = src.replace(/\u0000/g, "");                                            // 센티넬 주입 방지
+
+  // 펜스 코드블록: 줄 시작/끝 앵커, 비출력 센티넬로 분리
+  const blocks = [];
+  src = src.replace(/^```(\w*)\n([\s\S]*?)\n```$/gm, (_, lang, code) => {
+    blocks.push(`<pre><code>${esc(code)}</code></pre>`);
+    return `\u0000B${blocks.length - 1}\u0000`;
+  });
+
+  const inline = s => {
+    const codes = [];
+    // 인라인 코드 먼저 추출(강조/링크 치환에 안 깨지도록), 내용은 즉시 이스케이프
+    s = s.replace(/`([^`]+)`/g, (_, c) => { codes.push(`<code>${esc(c)}</code>`); return `\u0000C${codes.length - 1}\u0000`; });
+    return esc(s)
+      .replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (_, a, u) => `<img alt="${a}" src="${safeUrl(u)}">`)
+      .replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, t, u) => `<a href="${safeUrl(u)}" target="_blank" rel="noopener">${t}</a>`)
+      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+      .replace(/\*([^*]+)\*/g, "<em>$1</em>")
+      .replace(/~~([^~]+)~~/g, "<del>$1</del>")
+      .replace(/\u0000C(\d+)\u0000/g, (_, n) => codes[+n]);   // 코드 복원(마지막)
+  };
+
+  const lines = src.split("\n");
+  let html = "", para = [], list = null;
+  const flushPara = () => { if (para.length) { html += `<p>${inline(para.join(" "))}</p>`; para = []; } };
+  const flushList = () => { if (list) { html += `<${list.tag}>${list.items.map(i => `<li>${inline(i)}</li>`).join("")}</${list.tag}>`; list = null; } };
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    let m;
+    if ((m = line.match(/^\u0000B(\d+)\u0000$/))) { flushPara(); flushList(); if (blocks[+m[1]] !== undefined) html += blocks[+m[1]]; continue; }
+    if ((m = line.match(/^(#{1,6})\s+(.+)/))) { flushPara(); flushList(); html += `<h${m[1].length}>${inline(m[2])}</h${m[1].length}>`; continue; }
+    if (/^(-{3,}|\*{3,})\s*$/.test(line)) { flushPara(); flushList(); html += "<hr>"; continue; }
+    if ((m = line.match(/^>\s?(.*)/))) { flushPara(); flushList(); html += `<blockquote><p>${inline(m[1])}</p></blockquote>`; continue; }
+    if ((m = line.match(/^[-*+]\s+(.+)/))) { flushPara(); if (!list || list.tag !== "ul") { flushList(); list = { tag: "ul", items: [] }; } list.items.push(m[1]); continue; }
+    if ((m = line.match(/^\d+\.\s+(.+)/))) { flushPara(); if (!list || list.tag !== "ol") { flushList(); list = { tag: "ol", items: [] }; } list.items.push(m[1]); continue; }
+    if (line.includes("|") && i + 1 < lines.length && /^\s*\|?[\s:|-]+\|?\s*$/.test(lines[i + 1]) && lines[i + 1].includes("-")) {
+      flushPara(); flushList();
+      const cells = r => r.split("|").map(c => c.trim()).filter((c, j, a) => !(c === "" && (j === 0 || j === a.length - 1)));
+      let t = `<table><thead><tr>${cells(line).map(c => `<th>${inline(c)}</th>`).join("")}</tr></thead><tbody>`;
+      i++;
+      while (i + 1 < lines.length && lines[i + 1].includes("|")) { i++; t += `<tr>${cells(lines[i]).map(c => `<td>${inline(c)}</td>`).join("")}</tr>`; }
+      html += t + "</tbody></table>";
+      continue;
+    }
+    if (line.trim() === "") { flushPara(); flushList(); continue; }
+    flushList(); para.push(line.trim());
+  }
+  flushPara(); flushList();
+  return html;
+}
+
+/* ───────────── 상태 ───────────── */
+const $ = id => document.getElementById(id);
+const els = {
+  wordmark: $("wordmark"), tabs: $("tabs"), toggle: $("toggle"),
+  segView: $("segView"), segEdit: $("segEdit"), openBtn: $("openBtn"),
+  empty: $("empty"), content: $("content"), editor: $("editor"), fileInput: $("fileInput"),
+};
+
+let tabs = [];          // { id, name, raw, savedRaw, mode:'view'|'edit', scrollTop, selStart, selEnd, editorScroll, handle }
+let activeId = null;
+let programmaticScroll = false;
+let hintTimer = null;
+const SESSION_KEY = "mdv:session";
+const FIRSTRUN_KEY = "mdv:firstRunShown";
+let saveTimer = null;
+
+const uid = () => "t" + Date.now().toString(36) + Math.floor(Math.random() * 1e4).toString(36);
+const active = () => tabs.find(t => t.id === activeId) || null;
+const isDirty = t => t.raw !== t.savedRaw;
+
+/* ───────────── 렌더 ───────────── */
+function render() {
+  const has = tabs.length > 0;
+  els.wordmark.hidden = has;
+  els.tabs.hidden = !has;
+  els.toggle.hidden = !has;
+  els.empty.hidden = has;
+
+  if (!has) {
+    els.content.hidden = true;
+    els.editor.hidden = true;
+    document.title = "MD Viewer";
+    renderTabs();
+    return;
+  }
+
+  const t = active();
+  renderTabs();
+  els.segView.classList.toggle("active", t.mode === "view");
+  els.segEdit.classList.toggle("active", t.mode === "edit");
+  els.segView.setAttribute("aria-pressed", t.mode === "view" ? "true" : "false");
+  els.segEdit.setAttribute("aria-pressed", t.mode === "edit" ? "true" : "false");
+  document.title = (isDirty(t) ? "• " : "") + t.name + " — MD Viewer";
+
+  if (t.mode === "edit") {
+    els.content.hidden = true;
+    els.editor.hidden = false;
+    if (els.editor.value !== t.raw) els.editor.value = t.raw;
+    els.editor.selectionStart = t.selStart ?? 0;
+    els.editor.selectionEnd = t.selEnd ?? 0;
+    els.editor.scrollTop = t.editorScroll || 0;
+  } else {
+    els.editor.hidden = true;
+    els.content.hidden = false;
+    els.content.innerHTML = md(t.raw);
+    const maxY = Math.max(0, document.documentElement.scrollHeight - innerHeight);
+    programmaticScroll = true;                              // 복원 스크롤이 listener에 되먹임되지 않도록
+    window.scrollTo(0, Math.min(t.scrollTop || 0, maxY));
+    requestAnimationFrame(() => { programmaticScroll = false; });
+  }
+}
+
+function renderTabs() {
+  els.tabs.innerHTML = "";
+  for (const t of tabs) {
+    const el = document.createElement("div");
+    el.className = "tab" + (t.id === activeId ? " active" : "") + (isDirty(t) ? " dirty" : "");
+    el.dataset.id = t.id;
+    el.title = t.name;
+    el.tabIndex = 0;
+    el.setAttribute("role", "tab");
+    el.setAttribute("aria-selected", t.id === activeId ? "true" : "false");
+    el.setAttribute("aria-label", t.name + (isDirty(t) ? " (수정됨)" : ""));
+    el.innerHTML = `<span class="label"></span><span class="aff"><span class="dot"></span><button class="close" aria-label="닫기" tabindex="-1">×</button></span>`;
+    el.querySelector(".label").textContent = t.name;
+    els.tabs.appendChild(el);
+  }
+  els.tabs.classList.toggle("overflow", els.tabs.scrollWidth > els.tabs.clientWidth + 1);
+  const act = els.tabs.querySelector(".tab.active");
+  if (act) act.scrollIntoView({ inline: "nearest", block: "nearest" });
+}
+
+/* ───────────── 탭 조작 ───────────── */
+async function addTab(name, raw, handle) {
+  // 중복 열기 방지: 같은 핸들(우선) 또는 같은 이름의 '깨끗한' 탭이 있으면 재사용
+  let existing = null;
+  if (handle && handle.isSameEntry) {
+    for (const t of tabs) { if (t.handle && await t.handle.isSameEntry(handle)) { existing = t; break; } }
+  }
+  if (!existing) existing = tabs.find(t => t.name === name && !isDirty(t));
+  if (existing) {
+    if (!isDirty(existing)) { existing.raw = raw; existing.savedRaw = raw; }   // 미저장 편집은 보존
+    if (handle) existing.handle = handle;
+    activeId = existing.id;
+    saveSession();
+    render();
+    return;
+  }
+  const t = { id: uid(), name, raw, savedRaw: raw, mode: "view", scrollTop: 0, selStart: 0, selEnd: 0, editorScroll: 0, handle: handle || null };
+  tabs.push(t);
+  activeId = t.id;
+  saveSession();
+  render();
+}
+
+function activateTab(id) {
+  if (id === activeId) return;
+  snapshotScroll();
+  activeId = id;
+  saveSession();
+  render();
+}
+
+function closeTab(id) {
+  const i = tabs.findIndex(t => t.id === id);
+  if (i < 0) return;
+  if (isDirty(tabs[i]) && !confirm("저장하지 않은 변경사항이 있습니다. 닫을까요?")) return;
+  const wasActive = id === activeId;
+  tabs.splice(i, 1);
+  if (wasActive) {
+    const next = tabs[i] || tabs[i - 1] || null;   // 오른쪽 이웃 → 없으면 왼쪽
+    activeId = next ? next.id : null;
+  }
+  saveSession();
+  render();
+}
+
+function setMode(mode) {
+  const t = active();
+  if (!t || t.mode === mode) return;
+  snapshotScroll();                 // 떠나는 모드 상태(보기 스크롤/편집 캐럿) 보존
+  t.mode = mode;
+  saveSession();
+  render();
+  if (mode === "edit") requestAnimationFrame(() => els.editor.focus());
+}
+
+function snapshotScroll() {
+  const t = active();
+  if (!t) return;
+  if (t.mode === "view") {
+    t.scrollTop = window.scrollY;
+  } else {
+    t.selStart = els.editor.selectionStart;
+    t.selEnd = els.editor.selectionEnd;
+    t.editorScroll = els.editor.scrollTop;
+  }
+}
+
+/* ───────────── 파일 열기 ───────────── */
+const isText = name => /\.(md|markdown|mdown|mkd|txt|text)$/i.test(name);
+const hasExt = name => /\.[a-z0-9]+$/i.test(name);
+// 마크다운/텍스트 확장자, text/* MIME, 또는 확장자·MIME 모두 없는 파일(README 등)만 허용
+const acceptable = f => isText(f.name) || (f.type && f.type.startsWith("text")) || (!hasExt(f.name) && !f.type);
+
+function flashEmptyHint(msg) {
+  const hint = els.empty.querySelector(".hint");
+  if (!hint) return;
+  hint.textContent = msg;
+  hint.style.color = "var(--accent)";
+  if (hintTimer) clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hint.textContent = "또는 우측 상단 [열기]"; hint.style.color = ""; }, 2600);
+}
+
+async function openViaPicker() {
+  if (window.showOpenFilePicker) {
+    try {
+      const handles = await window.showOpenFilePicker({
+        multiple: true,
+        types: [{ description: "Markdown", accept: { "text/markdown": [".md", ".markdown", ".mdown", ".mkd"], "text/plain": [".txt"] } }],
+      });
+      for (const h of handles) { const f = await h.getFile(); await addTab(f.name, await f.text(), h); }
+    } catch (e) { if (e.name !== "AbortError") console.error(e); }
+  } else {
+    els.fileInput.click();
+  }
+}
+
+async function openFileList(fileList) {
+  let added = 0;
+  for (const f of fileList) { if (acceptable(f)) { await addTab(f.name, await f.text(), null); added++; } }
+  return added;
+}
+
+async function openFromDrop(dt) {
+  const before = tabs.length;
+  const items = dt.items;
+  if (items && items.length && items[0].getAsFileSystemHandle) {
+    for (const it of items) {
+      if (it.kind !== "file") continue;
+      const h = await it.getAsFileSystemHandle();
+      if (!h || h.kind !== "file") continue;        // 폴더(directory)는 건너뜀
+      const f = await h.getFile();
+      if (acceptable(f)) await addTab(f.name, await f.text(), h);
+    }
+  } else {
+    await openFileList(dt.files);
+  }
+  if (tabs.length === before) {
+    console.warn("드롭한 항목에서 열 수 있는 파일을 찾지 못했습니다 (폴더는 미지원).");
+    flashEmptyHint("열 수 있는 마크다운/텍스트 파일이 없어요 (폴더 미지원)");
+  }
+}
+
+/* ───────────── 저장 / 내보내기 ───────────── */
+async function saveActive() {
+  const t = active();
+  if (!t) return;
+  if (t.handle && t.handle.createWritable) {        // File System Access → 원본에 진짜 저장
+    try {
+      const w = await t.handle.createWritable();
+      await w.write(t.raw);
+      await w.close();
+      t.savedRaw = t.raw;
+      saveSession();
+      render();
+      return;
+    } catch (e) { /* 권한 거부 등 → 다운로드로 폴백 */ }
+  }
+  downloadMd(t);                                    // 폴백: .md 내보내기(= 디스크 사본 저장으로 간주)
+  t.savedRaw = t.raw;
+  saveSession();
+  render();
+}
+
+function downloadMd(t) {
+  const blob = new Blob([t.raw], { type: "text/markdown" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = /\.[a-z0-9]+$/i.test(t.name) ? t.name : t.name + ".md";
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+/* ───────────── 세션 영속 (localStorage) ───────────── */
+function saveSession() {
+  if (saveTimer) clearTimeout(saveTimer);
+  saveTimer = setTimeout(persist, 400);
+}
+function persist() {
+  try {
+    snapshotScroll();
+    const data = { activeId, tabs: tabs.map(t => ({ id: t.id, name: t.name, raw: t.raw, savedRaw: t.savedRaw, mode: t.mode, scrollTop: t.scrollTop, selStart: t.selStart, selEnd: t.selEnd, editorScroll: t.editorScroll })) };
+    localStorage.setItem(SESSION_KEY, JSON.stringify(data));   // handle은 직렬화 불가 → 복원 시 다운로드 저장으로 강등
+  } catch (e) {
+    console.warn("세션 저장 실패(저장 용량 초과 가능) — 편집 내용이 영구 보관되지 않을 수 있습니다.", e);
+  }
+}
+function loadSession() {
+  try {
+    const data = JSON.parse(localStorage.getItem(SESSION_KEY) || "null");
+    if (!data || !data.tabs || !data.tabs.length) return false;
+    tabs = data.tabs.map(t => ({ scrollTop: 0, selStart: 0, selEnd: 0, editorScroll: 0, ...t, handle: null }));
+    activeId = tabs.some(t => t.id === data.activeId) ? data.activeId : tabs[0].id;
+    return true;
+  } catch (e) { return false; }
+}
+
+/* ───────────── 이벤트 ───────────── */
+els.openBtn.onclick = openViaPicker;
+els.fileInput.onchange = e => { openFileList(e.target.files); e.target.value = ""; };
+els.segView.onclick = () => setMode("view");
+els.segEdit.onclick = () => setMode("edit");
+
+els.tabs.addEventListener("click", e => {
+  const tab = e.target.closest(".tab");
+  if (!tab) return;
+  if (e.target.closest(".close")) closeTab(tab.dataset.id);
+  else activateTab(tab.dataset.id);
+});
+
+// 탭 키보드 조작 (접근성): Enter/Space 활성화, Delete/Backspace 닫기, ←/→ 포커스 이동
+els.tabs.addEventListener("keydown", e => {
+  const tab = e.target.closest(".tab");
+  if (!tab) return;
+  if (e.key === "Enter" || e.key === " ") { e.preventDefault(); activateTab(tab.dataset.id); }
+  else if (e.key === "Delete" || e.key === "Backspace") { e.preventDefault(); closeTab(tab.dataset.id); }
+  else if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
+    e.preventDefault();
+    const all = [...els.tabs.querySelectorAll(".tab")];
+    const i = all.indexOf(tab);
+    const next = all[e.key === "ArrowRight" ? (i + 1) % all.length : (i - 1 + all.length) % all.length];
+    if (next) next.focus();
+  }
+});
+
+// 편집 입력 → raw 갱신 + dirty 표시 + 자동저장
+els.editor.addEventListener("input", () => {
+  const t = active();
+  if (!t) return;
+  t.raw = els.editor.value;
+  const tabEl = els.tabs.querySelector(`.tab[data-id="${t.id}"]`);
+  if (tabEl) { tabEl.classList.toggle("dirty", isDirty(t)); tabEl.setAttribute("aria-label", t.name + (isDirty(t) ? " (수정됨)" : "")); }
+  document.title = (isDirty(t) ? "• " : "") + t.name + " — MD Viewer";
+  saveSession();
+});
+
+// 편집 중 Tab → 들여쓰기 삽입 / Esc → 보기
+els.editor.addEventListener("keydown", e => {
+  if (e.key === "Tab") {
+    e.preventDefault();
+    const s = els.editor.selectionStart, en = els.editor.selectionEnd;
+    els.editor.value = els.editor.value.slice(0, s) + "\t" + els.editor.value.slice(en);
+    els.editor.selectionStart = els.editor.selectionEnd = s + 1;
+    els.editor.dispatchEvent(new Event("input"));
+  } else if (e.key === "Escape") {
+    setMode("view");
+  }
+});
+
+// 보기 스크롤 위치 추적 (복원 중 프로그램 스크롤은 무시 → 저장값 오염 방지)
+window.addEventListener("scroll", () => {
+  if (programmaticScroll) return;
+  const t = active();
+  if (t && t.mode === "view") t.scrollTop = window.scrollY;
+}, { passive: true });
+
+// 드래그앤드롭
+window.addEventListener("dragover", e => { e.preventDefault(); document.body.classList.add("dragging"); });
+window.addEventListener("dragleave", e => { if (!e.relatedTarget) document.body.classList.remove("dragging"); });
+window.addEventListener("drop", e => { e.preventDefault(); document.body.classList.remove("dragging"); openFromDrop(e.dataTransfer); });
+
+// 단축키 (일부는 PWA 독립창에서만 — 일반 브라우저 단축키 가로채지 않도록)
+const standalone = matchMedia("(display-mode: standalone)").matches;
+window.addEventListener("keydown", e => {
+  const mod = e.ctrlKey || e.metaKey;
+  if (!mod) return;
+  const k = e.key.toLowerCase();
+  if (k === "e") { e.preventDefault(); const t = active(); if (t) setMode(t.mode === "edit" ? "view" : "edit"); }
+  else if (k === "s") { e.preventDefault(); saveActive(); }
+  else if (k === "o") { e.preventDefault(); openViaPicker(); }
+  else if (k === "w" && standalone) { e.preventDefault(); if (activeId) closeTab(activeId); }
+  else if (k === "tab" && standalone) {
+    e.preventDefault();
+    if (tabs.length < 2) return;
+    const i = tabs.findIndex(t => t.id === activeId);
+    const next = e.shiftKey ? (i - 1 + tabs.length) % tabs.length : (i + 1) % tabs.length;
+    activateTab(tabs[next].id);
+  }
+});
+
+// 닫기/백그라운드 전 즉시 저장
+addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") persist(); });
+addEventListener("pagehide", persist);
+
+// PWA 파일 핸들러: .md 더블클릭으로 앱 실행 시 (manifest file_handlers 추가되면 동작)
+if ("launchQueue" in window) {
+  launchQueue.setConsumer(async params => {
+    if (!params.files || !params.files.length) return;
+    for (const h of params.files) { const f = await h.getFile(); await addTab(f.name, await f.text(), h); }
+  });
+}
+
+// 서비스워커 등록 (오프라인) — file://에서는 건너뜀
+if ("serviceWorker" in navigator && location.protocol.startsWith("http")) {
+  addEventListener("load", () => navigator.serviceWorker.register("sw.js").catch(e => console.warn("SW 등록 실패", e)));
+}
+
+/* ───────────── 시작 ───────────── */
+const WELCOME = `# MD Viewer
+
+가장 단순한 마크다운 뷰어. **열고, 읽고, 고친다.**
+
+## 쓰는 법
+
+1. 파일을 창에 끌어다 놓기 — 여러 개면 각각 **탭**으로 열립니다
+2. 또는 우측 상단 \`열기\`
+3. 탭 위 \`읽기 | 편집\` 으로 보기/편집 전환 (\`Ctrl/Cmd+E\`)
+
+> 편집한 내용은 자동으로 보관됩니다(브라우저를 닫았다 열어도 유지). \`Ctrl/Cmd+S\` 로 .md 파일로 내보낼 수 있어요.
+
+## 렌더링 미리보기
+
+**굵게**, *기울임*, ~~취소선~~, [링크](https://example.com), \`인라인 코드\`
+
+\`\`\`js
+const viewer = "simple";
+\`\`\`
+
+| 기능 | 상태 |
+| --- | --- |
+| 멀티탭 | ✓ |
+| 보기 / 편집 전환 | ✓ |
+| 자동 보관 · 무손실 | ✓ |
+| 다크 모드 (자동) | ✓ |
+
+---
+
+*프로토타입 — PWA(설치형) 래핑은 다음 단계입니다.*`;
+
+const SAMPLE = `# 편집 탭 예시
+
+이 탭에서 \`편집\`을 눌러 텍스트를 바꿔보세요.
+탭 이름 옆에 작은 점(•)이 생기면 저장 안 된 변경입니다.
+
+- 다른 탭으로 갔다 와도 내용·모드·스크롤이 유지됩니다
+- 변경된 탭을 닫으면 확인창이 뜹니다
+`;
+
+if (!loadSession() && !localStorage.getItem(FIRSTRUN_KEY)) {
+  // 첫 실행만: 멀티탭/편집을 바로 체험하도록 데모 두 개 (모두 닫으면 빈 화면, 재실행 시엔 안 뜸)
+  const mk = (name, raw) => ({ id: uid(), name, raw, savedRaw: raw, mode: "view", scrollTop: 0, selStart: 0, selEnd: 0, editorScroll: 0, handle: null });
+  tabs = [mk("welcome.md", WELCOME), mk("sample.md", SAMPLE)];
+  activeId = tabs[0].id;
+  try { localStorage.setItem(FIRSTRUN_KEY, "1"); } catch (e) {}
+}
+render();
+</script>
+</body>
+</html>
