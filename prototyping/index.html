@@ -109,6 +109,40 @@
   .open-btn { appearance: none; border: 1px solid var(--line); background: transparent; color: var(--fg); font: inherit; font-size: 13px; padding: 6px 14px; border-radius: 8px; cursor: pointer; }
   .open-btn:hover { border-color: var(--muted); }
 
+  /* ── 외부 변경 충돌 배너 / 토스트 ── */
+  #conflictBar {
+    position: sticky;
+    top: 52px;
+    z-index: 4;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    padding: 8px 14px;
+    font-size: 13px;
+    background: color-mix(in srgb, var(--accent) 10%, var(--bg));
+    border-bottom: 1px solid var(--line);
+  }
+  #conflictBar button { appearance: none; border: 1px solid var(--line); background: var(--bg); color: var(--fg); font: inherit; font-size: 12px; padding: 4px 10px; border-radius: 7px; cursor: pointer; }
+  #conflictBar button:hover { border-color: var(--muted); }
+  #conflictBar button.primary { border-color: var(--accent); color: var(--accent); }
+  #toast {
+    position: fixed;
+    left: 50%;
+    bottom: 28px;
+    transform: translateX(-50%);
+    background: var(--fg);
+    color: var(--bg);
+    font-size: 12.5px;
+    padding: 7px 14px;
+    border-radius: 999px;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity .25s;
+    z-index: 60;
+  }
+  #toast.show { opacity: .92; }
+
   /* ── 본문 ── */
   main { max-width: 720px; margin: 0 auto; padding: 44px 24px 120px; }
 
@@ -194,6 +228,13 @@
   </div>
 </header>
 
+<div id="conflictBar" hidden>
+  <span>파일이 앱 밖에서 수정되었습니다 — 편집 중인 내용과 겹칩니다.</span>
+  <button id="conflictReload" class="primary">디스크 내용으로 교체</button>
+  <button id="conflictKeep">내 편집 유지</button>
+</div>
+<div id="toast" role="status" aria-live="polite"></div>
+
 <main>
   <div id="empty">
     <div class="icon">⌘</div>
@@ -268,9 +309,10 @@ const els = {
   wordmark: $("wordmark"), tabs: $("tabs"), toggle: $("toggle"),
   segView: $("segView"), segEdit: $("segEdit"), openBtn: $("openBtn"),
   empty: $("empty"), content: $("content"), editor: $("editor"), fileInput: $("fileInput"),
+  conflictBar: $("conflictBar"), conflictReload: $("conflictReload"), conflictKeep: $("conflictKeep"), toast: $("toast"),
 };
 
-let tabs = [];          // { id, name, raw, savedRaw, mode:'view'|'edit', scrollTop, selStart, selEnd, editorScroll, handle }
+let tabs = [];          // { id, name, raw, savedRaw, mode:'view'|'edit', scrollTop, selStart, selEnd, editorScroll, handle, lastModified, externalChanged }
 let activeId = null;
 let programmaticScroll = false;
 let hintTimer = null;
@@ -294,6 +336,7 @@ function render() {
   if (!has) {
     els.content.hidden = true;
     els.editor.hidden = true;
+    els.conflictBar.hidden = true;
     document.title = "MD Viewer";
     renderTabs();
     return;
@@ -301,6 +344,7 @@ function render() {
 
   const t = active();
   renderTabs();
+  els.conflictBar.hidden = !t.externalChanged;
   els.segView.classList.toggle("active", t.mode === "view");
   els.segEdit.classList.toggle("active", t.mode === "edit");
   els.segView.setAttribute("aria-pressed", t.mode === "view" ? "true" : "false");
@@ -347,7 +391,7 @@ function renderTabs() {
 }
 
 /* ───────────── 탭 조작 ───────────── */
-async function addTab(name, raw, handle) {
+async function addTab(name, raw, handle, lastModified) {
   // 중복 열기 방지: 같은 핸들(우선) 또는 같은 이름의 '깨끗한' 탭이 있으면 재사용
   let existing = null;
   if (handle && handle.isSameEntry) {
@@ -355,15 +399,16 @@ async function addTab(name, raw, handle) {
   }
   if (!existing) existing = tabs.find(t => t.name === name && !isDirty(t));
   if (existing) {
-    if (!isDirty(existing)) { existing.raw = raw; existing.savedRaw = raw; }   // 미저장 편집은 보존
-    if (handle) { existing.handle = handle; putHandle(existing.id, handle); }
+    if (!isDirty(existing)) { existing.raw = raw; existing.savedRaw = raw; existing.externalChanged = false; }   // 미저장 편집은 보존
+    else if (raw !== existing.raw) existing.externalChanged = true;            // 편집본과 디스크가 다르면 충돌 알림
+    if (handle) { existing.handle = handle; existing.lastModified = lastModified ?? existing.lastModified; putHandle(existing.id, handle); watchHandle(handle); }
     activeId = existing.id;
     saveSession();
     render();
     return;
   }
-  const t = { id: uid(), name, raw, savedRaw: raw, mode: "view", scrollTop: 0, selStart: 0, selEnd: 0, editorScroll: 0, handle: handle || null };
-  if (handle) putHandle(t.id, handle);
+  const t = { id: uid(), name, raw, savedRaw: raw, mode: "view", scrollTop: 0, selStart: 0, selEnd: 0, editorScroll: 0, handle: handle || null, lastModified: handle ? (lastModified ?? null) : null, externalChanged: false };
+  if (handle) { putHandle(t.id, handle); watchHandle(handle); }
   tabs.push(t);
   activeId = t.id;
   saveSession();
@@ -383,6 +428,7 @@ function closeTab(id) {
   if (i < 0) return;
   if (isDirty(tabs[i]) && !confirm("저장하지 않은 변경사항이 있습니다. 닫을까요?")) return;
   const wasActive = id === activeId;
+  if (fsObserver && tabs[i].handle) { try { fsObserver.unobserve(tabs[i].handle); } catch (e) {} }
   tabs.splice(i, 1);
   delHandle(id);
   if (wasActive) {
@@ -430,6 +476,14 @@ function flashEmptyHint(msg) {
   hintTimer = setTimeout(() => { hint.textContent = "또는 우측 상단 [열기]"; hint.style.color = ""; }, 2600);
 }
 
+let toastTimer = null;
+function showToast(msg) {
+  els.toast.textContent = msg;
+  els.toast.classList.add("show");
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => els.toast.classList.remove("show"), 2200);
+}
+
 async function openViaPicker() {
   if (window.showOpenFilePicker) {
     try {
@@ -437,7 +491,7 @@ async function openViaPicker() {
         multiple: true,
         types: [{ description: "Markdown", accept: { "text/markdown": [".md", ".markdown", ".mdown", ".mkd"], "text/plain": [".txt"] } }],
       });
-      for (const h of handles) { const f = await h.getFile(); await addTab(f.name, await f.text(), h); }
+      for (const h of handles) { const f = await h.getFile(); await addTab(f.name, await f.text(), h, f.lastModified); }
     } catch (e) { if (e.name !== "AbortError") console.error(e); }
   } else {
     els.fileInput.click();
@@ -459,7 +513,7 @@ async function openFromDrop(dt) {
       const h = await it.getAsFileSystemHandle();
       if (!h || h.kind !== "file") continue;        // 폴더(directory)는 건너뜀
       const f = await h.getFile();
-      if (acceptable(f)) await addTab(f.name, await f.text(), h);
+      if (acceptable(f)) await addTab(f.name, await f.text(), h, f.lastModified);
     }
   } else {
     await openFileList(dt.files);
@@ -491,6 +545,8 @@ async function saveActive() {
         await w.write(t.raw);
         await w.close();
         t.savedRaw = t.raw;
+        t.externalChanged = false;                              // 내 저장이 최신 — 충돌 해소
+        try { t.lastModified = (await t.handle.getFile()).lastModified; } catch (e) {}   // 자체 저장을 외부 변경으로 오인하지 않도록
         saveSession();
         render();
         return;
@@ -512,6 +568,57 @@ function downloadMd(t) {
   a.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
+
+/* ───────────── 외부 변경 실시간 동기화 ─────────────
+   핸들이 있는 탭은 디스크의 lastModified를 주기적으로 대조하고,
+   FileSystemObserver 지원 브라우저에서는 변경 즉시 반영한다.
+   편집 중(dirty)인 탭은 덮어쓰지 않고 충돌 배너로 사용자가 선택. */
+const SYNC_INTERVAL = 2000;
+let syncing = false;
+
+async function reconcileTab(t) {
+  if (!t.handle) return;
+  try {
+    if (t.handle.queryPermission && await t.handle.queryPermission({ mode: "read" }) !== "granted") return;
+    const f = await t.handle.getFile();
+    if (f.lastModified === t.lastModified) return;
+    const text = await f.text();
+    t.lastModified = f.lastModified;
+    if (text === t.raw) {                                   // 내용 동일(자체 저장 직후, 무의미한 touch 등) — 상태만 정리
+      if (t.savedRaw !== text) { t.savedRaw = text; t.externalChanged = false; saveSession(); if (t.id === activeId) render(); }
+      return;
+    }
+    if (!isDirty(t)) {                                      // 편집 안 한 탭 → 조용히 새 내용 반영
+      t.raw = t.savedRaw = text;
+      t.externalChanged = false;
+      saveSession();
+      if (t.id === activeId) { render(); showToast("파일이 밖에서 수정되어 새로 불러왔습니다"); }
+    } else {                                                // 편집 중 → 덮어쓰지 않고 충돌 배너
+      t.externalChanged = true;
+      if (t.id === activeId) render();
+    }
+  } catch (e) { /* 파일 삭제·이동·일시적 읽기 실패 — 다음 확인 때 재시도 */ }
+}
+
+async function checkExternal() {
+  if (syncing) return;                                      // 겹침 방지
+  syncing = true;
+  try { for (const t of [...tabs]) await reconcileTab(t); }
+  finally { syncing = false; }
+}
+
+let fsObserver = null;
+if ("FileSystemObserver" in window) {
+  try { fsObserver = new FileSystemObserver(() => checkExternal()); } catch (e) {}
+}
+function watchHandle(h) {
+  if (!fsObserver) return;                                  // 미지원이면 폴링만으로 동작
+  try { Promise.resolve(fsObserver.observe(h)).catch(() => {}); } catch (e) {}
+}
+
+setInterval(() => { if (!document.hidden) checkExternal(); }, SYNC_INTERVAL);
+addEventListener("focus", () => checkExternal());           // 다른 앱에서 고치고 돌아온 순간 바로 반영
+addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") checkExternal(); });
 
 /* ───────────── 파일 핸들 영속 (IndexedDB) ─────────────
    localStorage는 FileSystemFileHandle을 못 담지만 IndexedDB는 담을 수 있음 →
@@ -538,10 +645,11 @@ async function restoreHandles() {
     const stale = [];
     keys.forEach((k, i) => {
       const t = tabs.find(t => t.id === k);
-      if (t && vals[i] && vals[i].kind === "file") t.handle = vals[i];
+      if (t && vals[i] && vals[i].kind === "file") { t.handle = vals[i]; watchHandle(t.handle); }
       else stale.push(k);                            // 닫힌 탭의 핸들은 정리
     });
     if (stale.length) { const w = await idbStore("readwrite"); stale.forEach(k => w.delete(k)); }
+    checkExternal();                                 // 복원 직후 디스크와 즉시 대조 (권한 없으면 조용히 건너뜀)
   } catch (e) { /* IndexedDB 불가(file:// 등) → 다운로드 저장으로 폴백 */ }
 }
 
@@ -563,7 +671,7 @@ function loadSession() {
   try {
     const data = JSON.parse(localStorage.getItem(SESSION_KEY) || "null");
     if (!data || !data.tabs || !data.tabs.length) return false;
-    tabs = data.tabs.map(t => ({ scrollTop: 0, selStart: 0, selEnd: 0, editorScroll: 0, ...t, handle: null }));
+    tabs = data.tabs.map(t => ({ scrollTop: 0, selStart: 0, selEnd: 0, editorScroll: 0, ...t, handle: null, lastModified: null, externalChanged: false }));
     activeId = tabs.some(t => t.id === data.activeId) ? data.activeId : tabs[0].id;
     restoreHandles();                                // 비동기 — 핸들은 잠시 뒤 재연결됨
     return true;
@@ -575,6 +683,26 @@ els.openBtn.onclick = openViaPicker;
 els.fileInput.onchange = e => { openFileList(e.target.files); e.target.value = ""; };
 els.segView.onclick = () => setMode("view");
 els.segEdit.onclick = () => setMode("edit");
+
+// 외부 변경 충돌 배너: 디스크 내용으로 교체(내 편집 폐기) / 내 편집 유지(이번 변경 건 무시)
+els.conflictReload.onclick = async () => {
+  const t = active();
+  if (!t || !t.handle) return;
+  try {
+    const f = await t.handle.getFile();
+    t.raw = t.savedRaw = await f.text();
+    t.lastModified = f.lastModified;
+    t.externalChanged = false;
+    saveSession();
+    render();
+  } catch (e) { showToast("디스크에서 다시 읽지 못했습니다"); }
+};
+els.conflictKeep.onclick = () => {
+  const t = active();
+  if (!t) return;
+  t.externalChanged = false;                        // 다음 외부 변경이 생기면 다시 알림
+  render();
+};
 
 els.tabs.addEventListener("click", e => {
   const tab = e.target.closest(".tab");
@@ -714,7 +842,7 @@ addEventListener("pagehide", persist);
 if ("launchQueue" in window) {
   launchQueue.setConsumer(async params => {
     if (!params.files || !params.files.length) return;
-    for (const h of params.files) { const f = await h.getFile(); await addTab(f.name, await f.text(), h); }
+    for (const h of params.files) { const f = await h.getFile(); await addTab(f.name, await f.text(), h, f.lastModified); }
   });
 }
 
