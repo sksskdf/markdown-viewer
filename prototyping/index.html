@@ -99,6 +99,7 @@
   .tab:hover .dot, .tab:focus-within .dot { display: none; }
   .tab:hover .close, .tab:focus-within .close { display: inline-flex; }
   .tab .close:hover { background: var(--code-bg); color: var(--fg); }
+  .tab.drag-src { opacity: .35; }
 
   /* 오른쪽 고정 컨트롤 */
   .controls { display: flex; align-items: center; gap: 8px; flex: none; margin-left: auto; }
@@ -273,6 +274,7 @@ let tabs = [];          // { id, name, raw, savedRaw, mode:'view'|'edit', scroll
 let activeId = null;
 let programmaticScroll = false;
 let hintTimer = null;
+let dragTabId = null;   // 재정렬 드래그 중인 탭 id — 파일 드롭 오버레이와 구분용
 const SESSION_KEY = "mdv:session";
 const FIRSTRUN_KEY = "mdv:firstRunShown";
 let saveTimer = null;
@@ -331,6 +333,7 @@ function renderTabs() {
     el.dataset.id = t.id;
     el.title = t.name;
     el.tabIndex = 0;
+    el.draggable = true;
     el.setAttribute("role", "tab");
     el.setAttribute("aria-selected", t.id === activeId ? "true" : "false");
     el.setAttribute("aria-label", t.name + (isDirty(t) ? " (수정됨)" : ""));
@@ -353,13 +356,14 @@ async function addTab(name, raw, handle) {
   if (!existing) existing = tabs.find(t => t.name === name && !isDirty(t));
   if (existing) {
     if (!isDirty(existing)) { existing.raw = raw; existing.savedRaw = raw; }   // 미저장 편집은 보존
-    if (handle) existing.handle = handle;
+    if (handle) { existing.handle = handle; putHandle(existing.id, handle); }
     activeId = existing.id;
     saveSession();
     render();
     return;
   }
   const t = { id: uid(), name, raw, savedRaw: raw, mode: "view", scrollTop: 0, selStart: 0, selEnd: 0, editorScroll: 0, handle: handle || null };
+  if (handle) putHandle(t.id, handle);
   tabs.push(t);
   activeId = t.id;
   saveSession();
@@ -380,6 +384,7 @@ function closeTab(id) {
   if (isDirty(tabs[i]) && !confirm("저장하지 않은 변경사항이 있습니다. 닫을까요?")) return;
   const wasActive = id === activeId;
   tabs.splice(i, 1);
+  delHandle(id);
   if (wasActive) {
     const next = tabs[i] || tabs[i - 1] || null;   // 오른쪽 이웃 → 없으면 왼쪽
     activeId = next ? next.id : null;
@@ -466,19 +471,31 @@ async function openFromDrop(dt) {
 }
 
 /* ───────────── 저장 / 내보내기 ───────────── */
+// 복원된 핸들은 쓰기 권한이 풀려 있을 수 있음 → Ctrl+S(사용자 제스처) 시점에 재요청
+async function ensureWritable(h) {
+  const opts = { mode: "readwrite" };
+  try {
+    if (h.queryPermission && await h.queryPermission(opts) === "granted") return true;
+    if (h.requestPermission) return await h.requestPermission(opts) === "granted";
+  } catch (e) {}
+  return true;   // 권한 API가 없으면 createWritable 시도에 맡김
+}
+
 async function saveActive() {
   const t = active();
   if (!t) return;
   if (t.handle && t.handle.createWritable) {        // File System Access → 원본에 진짜 저장
     try {
-      const w = await t.handle.createWritable();
-      await w.write(t.raw);
-      await w.close();
-      t.savedRaw = t.raw;
-      saveSession();
-      render();
-      return;
-    } catch (e) { /* 권한 거부 등 → 다운로드로 폴백 */ }
+      if (await ensureWritable(t.handle)) {
+        const w = await t.handle.createWritable();
+        await w.write(t.raw);
+        await w.close();
+        t.savedRaw = t.raw;
+        saveSession();
+        render();
+        return;
+      }
+    } catch (e) { console.warn("원본 저장 실패 → 다운로드로 폴백", e); }
   }
   downloadMd(t);                                    // 폴백: .md 내보내기(= 디스크 사본 저장으로 간주)
   t.savedRaw = t.raw;
@@ -496,6 +513,38 @@ function downloadMd(t) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+/* ───────────── 파일 핸들 영속 (IndexedDB) ─────────────
+   localStorage는 FileSystemFileHandle을 못 담지만 IndexedDB는 담을 수 있음 →
+   앱을 껐다 켜도 Ctrl+S가 원본 파일에 저장된다. */
+function idbStore(mode) {
+  return new Promise((res, rej) => {
+    const req = indexedDB.open("mdv-handles", 1);
+    req.onupgradeneeded = () => req.result.createObjectStore("handles");
+    req.onsuccess = () => {
+      const tx = req.result.transaction("handles", mode);
+      tx.oncomplete = () => req.result.close();
+      res(tx.objectStore("handles"));
+    };
+    req.onerror = () => rej(req.error);
+  });
+}
+const idbReq = r => new Promise((res, rej) => { r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+const putHandle = (id, h) => idbStore("readwrite").then(s => idbReq(s.put(h, id))).catch(() => {});
+const delHandle = id => idbStore("readwrite").then(s => idbReq(s.delete(id))).catch(() => {});
+async function restoreHandles() {
+  try {
+    const s = await idbStore("readonly");
+    const [keys, vals] = await Promise.all([idbReq(s.getAllKeys()), idbReq(s.getAll())]);
+    const stale = [];
+    keys.forEach((k, i) => {
+      const t = tabs.find(t => t.id === k);
+      if (t && vals[i] && vals[i].kind === "file") t.handle = vals[i];
+      else stale.push(k);                            // 닫힌 탭의 핸들은 정리
+    });
+    if (stale.length) { const w = await idbStore("readwrite"); stale.forEach(k => w.delete(k)); }
+  } catch (e) { /* IndexedDB 불가(file:// 등) → 다운로드 저장으로 폴백 */ }
+}
+
 /* ───────────── 세션 영속 (localStorage) ───────────── */
 function saveSession() {
   if (saveTimer) clearTimeout(saveTimer);
@@ -505,7 +554,7 @@ function persist() {
   try {
     snapshotScroll();
     const data = { activeId, tabs: tabs.map(t => ({ id: t.id, name: t.name, raw: t.raw, savedRaw: t.savedRaw, mode: t.mode, scrollTop: t.scrollTop, selStart: t.selStart, selEnd: t.selEnd, editorScroll: t.editorScroll })) };
-    localStorage.setItem(SESSION_KEY, JSON.stringify(data));   // handle은 직렬화 불가 → 복원 시 다운로드 저장으로 강등
+    localStorage.setItem(SESSION_KEY, JSON.stringify(data));   // handle은 IndexedDB에 별도 보관 (putHandle/restoreHandles)
   } catch (e) {
     console.warn("세션 저장 실패(저장 용량 초과 가능) — 편집 내용이 영구 보관되지 않을 수 있습니다.", e);
   }
@@ -516,6 +565,7 @@ function loadSession() {
     if (!data || !data.tabs || !data.tabs.length) return false;
     tabs = data.tabs.map(t => ({ scrollTop: 0, selStart: 0, selEnd: 0, editorScroll: 0, ...t, handle: null }));
     activeId = tabs.some(t => t.id === data.activeId) ? data.activeId : tabs[0].id;
+    restoreHandles();                                // 비동기 — 핸들은 잠시 뒤 재연결됨
     return true;
   } catch (e) { return false; }
 }
@@ -533,12 +583,23 @@ els.tabs.addEventListener("click", e => {
   else activateTab(tab.dataset.id);
 });
 
-// 탭 키보드 조작 (접근성): Enter/Space 활성화, Delete/Backspace 닫기, ←/→ 포커스 이동
+// 탭 키보드 조작 (접근성): Enter/Space 활성화, Delete/Backspace 닫기, ←/→ 포커스 이동, Ctrl+←/→ 순서 이동
 els.tabs.addEventListener("keydown", e => {
   const tab = e.target.closest(".tab");
   if (!tab) return;
   if (e.key === "Enter" || e.key === " ") { e.preventDefault(); activateTab(tab.dataset.id); }
   else if (e.key === "Delete" || e.key === "Backspace") { e.preventDefault(); closeTab(tab.dataset.id); }
+  else if ((e.key === "ArrowRight" || e.key === "ArrowLeft") && (e.ctrlKey || e.metaKey)) {
+    e.preventDefault();
+    const i = tabs.findIndex(t => t.id === tab.dataset.id);
+    const j = e.key === "ArrowRight" ? i + 1 : i - 1;
+    if (i < 0 || j < 0 || j >= tabs.length) return;
+    [tabs[i], tabs[j]] = [tabs[j], tabs[i]];
+    saveSession();
+    renderTabs();
+    const el = els.tabs.querySelector(`.tab[data-id="${tab.dataset.id}"]`);
+    if (el) el.focus();
+  }
   else if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
     e.preventDefault();
     const all = [...els.tabs.querySelectorAll(".tab")];
@@ -546,6 +607,40 @@ els.tabs.addEventListener("keydown", e => {
     const next = all[e.key === "ArrowRight" ? (i + 1) % all.length : (i - 1 + all.length) % all.length];
     if (next) next.focus();
   }
+});
+
+// 탭 드래그 재정렬: 드래그 중엔 DOM 노드만 옮기고(같은 노드 유지 — 드래그가 안 끊기게), 끝나면 순서를 상태에 반영
+els.tabs.addEventListener("dragstart", e => {
+  const tab = e.target.closest(".tab");
+  if (!tab) return;
+  dragTabId = tab.dataset.id;
+  tab.classList.add("drag-src");
+  e.dataTransfer.effectAllowed = "move";
+  e.dataTransfer.setData("text/plain", tab.dataset.id);   // Firefox는 데이터가 있어야 드래그가 시작됨
+});
+els.tabs.addEventListener("dragover", e => {
+  if (!dragTabId) return;
+  e.preventDefault();
+  e.dataTransfer.dropEffect = "move";
+  const src = els.tabs.querySelector(".tab.drag-src");
+  if (!src) return;
+  const over = e.target.closest(".tab");
+  if (over && over !== src) {
+    const r = over.getBoundingClientRect();
+    els.tabs.insertBefore(src, e.clientX < r.left + r.width / 2 ? over : over.nextSibling);
+  } else if (!over) {
+    const last = els.tabs.lastElementChild;
+    if (last && last !== src && e.clientX > last.getBoundingClientRect().right) els.tabs.appendChild(src);
+  }
+});
+els.tabs.addEventListener("drop", e => { if (dragTabId) { e.preventDefault(); e.stopPropagation(); } });
+els.tabs.addEventListener("dragend", () => {
+  if (!dragTabId) return;
+  dragTabId = null;
+  const order = [...els.tabs.querySelectorAll(".tab")].map(el => el.dataset.id);
+  tabs.sort((a, b) => order.indexOf(a.id) - order.indexOf(b.id));
+  saveSession();
+  renderTabs();                                     // drag-src 제거 겸 재그림
 });
 
 // 편집 입력 → raw 갱신 + dirty 표시 + 자동저장
@@ -579,10 +674,18 @@ window.addEventListener("scroll", () => {
   if (t && t.mode === "view") t.scrollTop = window.scrollY;
 }, { passive: true });
 
-// 드래그앤드롭
-window.addEventListener("dragover", e => { e.preventDefault(); document.body.classList.add("dragging"); });
+// 파일 드래그앤드롭 — 탭 재정렬 드래그와 구분: 파일을 끌 때만 오버레이/열기
+const hasFiles = dt => dt && [...dt.types].includes("Files");
+window.addEventListener("dragover", e => {
+  e.preventDefault();
+  if (!dragTabId && hasFiles(e.dataTransfer)) document.body.classList.add("dragging");
+});
 window.addEventListener("dragleave", e => { if (!e.relatedTarget) document.body.classList.remove("dragging"); });
-window.addEventListener("drop", e => { e.preventDefault(); document.body.classList.remove("dragging"); openFromDrop(e.dataTransfer); });
+window.addEventListener("drop", e => {
+  e.preventDefault();
+  document.body.classList.remove("dragging");
+  if (!dragTabId && hasFiles(e.dataTransfer)) openFromDrop(e.dataTransfer);
+});
 
 // 단축키 (일부는 PWA 독립창에서만 — 일반 브라우저 단축키 가로채지 않도록)
 const standalone = matchMedia("(display-mode: standalone)").matches;
@@ -615,9 +718,9 @@ if ("launchQueue" in window) {
   });
 }
 
-// 서비스워커 등록 (오프라인) — file://에서는 건너뜀
+// 서비스워커 등록 (오프라인) — file://에서는 건너뜀. updateViaCache:none → sw.js가 HTTP 캐시에 안 걸려 배포가 바로 감지됨
 if ("serviceWorker" in navigator && location.protocol.startsWith("http")) {
-  addEventListener("load", () => navigator.serviceWorker.register("sw.js").catch(e => console.warn("SW 등록 실패", e)));
+  addEventListener("load", () => navigator.serviceWorker.register("sw.js", { updateViaCache: "none" }).catch(e => console.warn("SW 등록 실패", e)));
 }
 
 /* ───────────── 시작 ───────────── */
