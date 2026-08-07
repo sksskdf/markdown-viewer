@@ -444,10 +444,25 @@ function setMode(mode) {
   const t = active();
   if (!t || t.mode === mode) return;
   snapshotScroll();                 // 떠나는 모드 상태(보기 스크롤/편집 캐럿) 보존
+  // 떠나는 모드의 스크롤 비율을 들어가는 모드에 매핑 — 읽던 위치가 전환 후에도 이어지도록
+  const leavingMax = t.mode === "view"
+    ? document.documentElement.scrollHeight - innerHeight
+    : els.editor.scrollHeight - els.editor.clientHeight;
+  const ratio = leavingMax > 0 ? Math.min(1, (t.mode === "view" ? t.scrollTop : t.editorScroll) / leavingMax) : 0;
   t.mode = mode;
-  saveSession();
   render();
-  if (mode === "edit") requestAnimationFrame(() => els.editor.focus());
+  if (mode === "edit") {
+    t.editorScroll = ratio * Math.max(0, els.editor.scrollHeight - els.editor.clientHeight);
+    els.editor.scrollTop = t.editorScroll;
+    // focus()가 캐럿 위치로 스크롤을 끌고 가지 않도록, 포커스 후 매핑 위치를 다시 적용
+    requestAnimationFrame(() => { els.editor.focus(); els.editor.scrollTop = t.editorScroll; });
+  } else {
+    t.scrollTop = ratio * Math.max(0, document.documentElement.scrollHeight - innerHeight);
+    programmaticScroll = true;
+    window.scrollTo(0, t.scrollTop);
+    requestAnimationFrame(() => { programmaticScroll = false; });
+  }
+  saveSession();
 }
 
 function snapshotScroll() {
