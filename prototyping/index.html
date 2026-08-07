@@ -28,7 +28,8 @@
     }
   }
   * { box-sizing: border-box; }
-  html, body { margin: 0; padding: 0; height: 100%; }
+  /* height:100%는 body를 한 화면 높이로 고정해 sticky 헤더가 한 화면 이후 풀리는 원인 — min-height로 콘텐츠만큼 늘어나게 */
+  html, body { margin: 0; padding: 0; min-height: 100%; }
   /* hidden 속성이 어떤 display 규칙도 이기도록 — 빈 상태가 안 사라지던 버그 방지 */
   [hidden] { display: none !important; }
   :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
