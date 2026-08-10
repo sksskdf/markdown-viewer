@@ -213,6 +213,13 @@
   #content table { border-collapse: collapse; width: 100%; margin: 1em 0; font-size: .92em; }
   #content th, #content td { border: 1px solid var(--line); padding: 8px 12px; text-align: left; }
   #content th { background: var(--code-bg); font-weight: 600; }
+
+  /* 머메이드 다이어그램 — 렌더 전·로드 실패 시엔 소스가 코드블록처럼 보이고, 렌더되면 중앙 정렬된 그림 */
+  #content pre.mermaid { font-family: "JetBrains Mono", Consolas, monospace; font-size: .85em; }
+  #content pre.mermaid[data-processed]:not([data-error]) { background: none; padding: 8px 0; text-align: center; font-size: 1em; }
+  #content pre.mermaid svg { max-width: 100%; height: auto; }
+  #content pre.mermaid[data-error] { border-left: 3px solid var(--accent); }
+  #content pre.mermaid[data-error]::before { content: "다이어그램 문법 오류 — 원본을 표시합니다"; display: block; margin-bottom: 10px; font-family: Pretendard, -apple-system, "Segoe UI", "Malgun Gothic", sans-serif; font-size: 12px; color: var(--accent); }
 </style>
 </head>
 <body>
@@ -258,7 +265,9 @@ function md(src) {
   // 펜스 코드블록: 줄 시작/끝 앵커, 비출력 센티넬로 분리
   const blocks = [];
   src = src.replace(/^```(\w*)\n([\s\S]*?)\n```$/gm, (_, lang, code) => {
-    blocks.push(`<pre><code>${esc(code)}</code></pre>`);
+    blocks.push(lang.toLowerCase() === "mermaid"
+      ? `<pre class="mermaid">${esc(code)}</pre>`          // 실제 렌더는 renderMermaid()가 비동기로
+      : `<pre><code>${esc(code)}</code></pre>`);
     return `\u0000B${blocks.length - 1}\u0000`;
   });
 
@@ -303,6 +312,57 @@ function md(src) {
   flushPara(); flushList();
   return html;
 }
+
+/* ───────────── 머메이드 다이어그램 ─────────────
+   vendor/mermaid.min.js(로컬 번들 — 오프라인 동작)를 다이어그램이 있는 문서를
+   처음 볼 때만 지연 로드. 문법 오류 블록은 소스로 되돌리고 오류 표시,
+   로드 실패 시엔 소스가 코드블록 모양 그대로 남는다. */
+let mermaidLoading = null;
+let mermaidSeq = 0;          // 탭 전환·재렌더 경합 방지 토큰
+let mermaidUid = 0;
+const darkMedia = matchMedia("(prefers-color-scheme: dark)");
+
+function loadMermaid() {
+  if (window.mermaid) return Promise.resolve();
+  mermaidLoading ??= new Promise((res, rej) => {
+    const s = document.createElement("script");
+    s.src = "vendor/mermaid.min.js";
+    s.onload = res;
+    s.onerror = () => { mermaidLoading = null; s.remove(); rej(new Error("mermaid 로드 실패")); };
+    document.head.appendChild(s);
+  });
+  return mermaidLoading;
+}
+
+async function renderMermaid() {
+  const nodes = [...els.content.querySelectorAll("pre.mermaid:not([data-processed])")];
+  if (!nodes.length) return;
+  const seq = ++mermaidSeq;
+  try { await loadMermaid(); } catch (e) { console.warn(e); return; }
+  if (seq !== mermaidSeq) return;                       // 그 사이 다른 문서로 재렌더됨
+  mermaid.initialize({
+    startOnLoad: false,
+    securityLevel: "strict",
+    suppressErrorRendering: true,                       // 오류 시 mermaid의 폭탄 그림 대신 우리 폴백 사용
+    theme: darkMedia.matches ? "dark" : "default",
+    fontFamily: 'Pretendard, -apple-system, "Segoe UI", "Malgun Gothic", sans-serif',
+  });
+  for (const el of nodes) {
+    if (!el.isConnected) continue;                      // 렌더 중 문서가 바뀐 경우
+    const srcText = el.textContent;
+    try {
+      const { svg } = await mermaid.render("mmd" + ++mermaidUid, srcText);
+      el.innerHTML = svg;
+    } catch (e) {
+      el.textContent = srcText;
+      el.setAttribute("data-error", "");
+    }
+    el.setAttribute("data-processed", "true");
+  }
+}
+
+// 시스템 다크/라이트 전환 시 현재 문서의 다이어그램을 새 테마로 다시 그림
+darkMedia.addEventListener?.("change", () => { const t = active(); if (t && t.mode === "view") render(); });
 
 /* ───────────── 상태 ───────────── */
 const $ = id => document.getElementById(id);
@@ -363,6 +423,7 @@ function render() {
     els.editor.hidden = true;
     els.content.hidden = false;
     els.content.innerHTML = md(t.raw);
+    renderMermaid();                                        // 다이어그램은 비동기로 뒤따라 그려짐
     const maxY = Math.max(0, document.documentElement.scrollHeight - innerHeight);
     programmaticScroll = true;                              // 복원 스크롤이 listener에 되먹임되지 않도록
     window.scrollTo(0, Math.min(t.scrollTop || 0, maxY));
@@ -888,10 +949,19 @@ const WELCOME = `# MD Viewer
 const viewer = "simple";
 \`\`\`
 
+\`\`\`mermaid
+graph LR
+  A[파일 열기] --> B{편집할까?}
+  B -- 예 --> C[편집 모드]
+  B -- 아니오 --> D[읽기 모드]
+  C --> E[Ctrl+S 저장]
+\`\`\`
+
 | 기능 | 상태 |
 | --- | --- |
 | 멀티탭 | ✓ |
 | 보기 / 편집 전환 | ✓ |
+| 머메이드 다이어그램 | ✓ |
 | 자동 보관 · 무손실 | ✓ |
 | 다크 모드 (자동) | ✓ |
 
