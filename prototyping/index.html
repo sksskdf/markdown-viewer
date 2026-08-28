@@ -110,8 +110,8 @@
   .open-btn { appearance: none; border: 1px solid var(--line); background: transparent; color: var(--fg); font: inherit; font-size: 13px; padding: 6px 14px; border-radius: 8px; cursor: pointer; }
   .open-btn:hover { border-color: var(--muted); }
 
-  /* ── 외부 변경 충돌 배너 / 토스트 ── */
-  #conflictBar {
+  /* ── 외부 변경 충돌 / 로컬 이미지 폴더 연결 배너 / 토스트 ── */
+  #conflictBar, #assetBar {
     position: sticky;
     top: 52px;
     z-index: 4;
@@ -124,9 +124,10 @@
     background: color-mix(in srgb, var(--accent) 10%, var(--bg));
     border-bottom: 1px solid var(--line);
   }
-  #conflictBar button { appearance: none; border: 1px solid var(--line); background: var(--bg); color: var(--fg); font: inherit; font-size: 12px; padding: 4px 10px; border-radius: 7px; cursor: pointer; }
-  #conflictBar button:hover { border-color: var(--muted); }
-  #conflictBar button.primary { border-color: var(--accent); color: var(--accent); }
+  #assetBar { z-index: 3; }
+  #conflictBar button, #assetBar button { appearance: none; border: 1px solid var(--line); background: var(--bg); color: var(--fg); font: inherit; font-size: 12px; padding: 4px 10px; border-radius: 7px; cursor: pointer; }
+  #conflictBar button:hover, #assetBar button:hover { border-color: var(--muted); }
+  #conflictBar button.primary, #assetBar button.primary { border-color: var(--accent); color: var(--accent); }
   #toast {
     position: fixed;
     left: 50%;
@@ -244,6 +245,10 @@
   <button id="conflictReload" class="primary">디스크 내용으로 교체</button>
   <button id="conflictKeep">내 편집 유지</button>
 </div>
+<div id="assetBar" hidden>
+  <span>문서가 로컬 이미지를 참조합니다 — 이미지가 있는 폴더를 연결하면 표시됩니다.</span>
+  <button id="assetPick" class="primary">폴더 연결</button>
+</div>
 <div id="toast" role="status" aria-live="polite"></div>
 
 <main>
@@ -257,6 +262,7 @@
 </main>
 
 <input type="file" id="fileInput" accept=".md,.markdown,.txt,.mdown,.mkd" multiple hidden>
+<input type="file" id="dirInput" webkitdirectory hidden>
 
 <script>
 /* ───────────── 미니멀 마크다운 파서 (외부 의존성 없음) ───────────── */
@@ -381,11 +387,12 @@ const $ = id => document.getElementById(id);
 const els = {
   wordmark: $("wordmark"), tabs: $("tabs"), toggle: $("toggle"),
   segView: $("segView"), segEdit: $("segEdit"), openBtn: $("openBtn"),
-  empty: $("empty"), content: $("content"), editor: $("editor"), fileInput: $("fileInput"),
+  empty: $("empty"), content: $("content"), editor: $("editor"), fileInput: $("fileInput"), dirInput: $("dirInput"),
   conflictBar: $("conflictBar"), conflictReload: $("conflictReload"), conflictKeep: $("conflictKeep"), toast: $("toast"),
+  assetBar: $("assetBar"), assetPick: $("assetPick"),
 };
 
-let tabs = [];          // { id, name, raw, savedRaw, mode:'view'|'edit', scrollTop, selStart, selEnd, editorScroll, handle, lastModified, externalChanged }
+let tabs = [];          // { id, name, raw, savedRaw, mode:'view'|'edit', scrollTop, selStart, selEnd, editorScroll, handle, lastModified, externalChanged, dirHandle, dirFiles }
 let activeId = null;
 let programmaticScroll = false;
 let hintTimer = null;
@@ -401,6 +408,7 @@ const isDirty = t => t.raw !== t.savedRaw;
 /* ───────────── 렌더 ───────────── */
 function render() {
   const has = tabs.length > 0;
+  els.assetBar.hidden = true;                 // 보기 모드에서 hydrateLocalImages()가 필요할 때만 다시 연다
   els.wordmark.hidden = has;
   els.tabs.hidden = !has;
   els.toggle.hidden = !has;
@@ -434,8 +442,11 @@ function render() {
   } else {
     els.editor.hidden = true;
     els.content.hidden = false;
+    blobUrls.forEach(u => URL.revokeObjectURL(u));          // 이전 렌더의 로컬 이미지 URL 정리
+    blobUrls = [];
     els.content.innerHTML = md(t.raw);
     renderMermaid();                                        // 다이어그램은 비동기로 뒤따라 그려짐
+    hydrateLocalImages(t);                                  // 상대 경로 이미지는 연결된 폴더에서 비동기로 해석
     const maxY = Math.max(0, document.documentElement.scrollHeight - innerHeight);
     programmaticScroll = true;                              // 복원 스크롤이 listener에 되먹임되지 않도록
     window.scrollTo(0, Math.min(t.scrollTop || 0, maxY));
@@ -464,8 +475,73 @@ function renderTabs() {
   if (act) act.scrollIntoView({ inline: "nearest", block: "nearest" });
 }
 
+/* ───────────── 로컬 이미지 해석 ─────────────
+   문서가 ![...](images/foo.svg)처럼 상대 경로를 참조하면 웹앱은 디스크의
+   옆 파일을 읽을 수 없어 404가 난다(브라우저 보안). 폴더를 연결받으면
+   그 안에서 파일을 찾아 blob URL로 바꿔 그린다. 폴더 드롭 시엔 자동 연결. */
+let assetSeq = 0;         // 탭 전환·재렌더 경합 방지 토큰
+let blobUrls = [];
+const isRelSrc = u => !!u && !/^(https?:|data:|blob:|#|\/\/)/i.test(u);
+
+async function lookupLocalFile(t, rel) {
+  const segs = rel.split("/").map(s => { try { return decodeURIComponent(s); } catch (e) { return s; } }).filter(s => s && s !== ".");
+  if (!segs.length || segs.includes("..")) return null;              // 연결된 폴더 위로 탈출 금지
+  if (t.dirFiles) return t.dirFiles.get(segs.join("/")) || null;     // webkitdirectory 폴백(핸들 미지원 브라우저)
+  try {
+    let dir = t.dirHandle;
+    for (const s of segs.slice(0, -1)) dir = await dir.getDirectoryHandle(s);
+    return await (await dir.getFileHandle(segs[segs.length - 1])).getFile();
+  } catch (e) { return null; }                                       // 없는 파일·이동됨 — 깨진 채로 두고 배너 유지
+}
+
+async function hydrateLocalImages(t) {
+  const imgs = [...els.content.querySelectorAll("img")].filter(el => isRelSrc(el.getAttribute("src")));
+  if (!imgs.length) return;
+  let granted = !!t.dirFiles;
+  if (!granted && t.dirHandle) {
+    try { granted = !t.dirHandle.queryPermission || await t.dirHandle.queryPermission({ mode: "read" }) === "granted"; } catch (e) {}
+  }
+  if (!granted) { els.assetBar.hidden = false; return; }             // 연결 전·권한 만료 → 배너로 유도
+  const seq = ++assetSeq;
+  let missing = 0;
+  for (const el of imgs) {
+    const rel = el.getAttribute("src");
+    const f = await lookupLocalFile(t, rel);
+    if (seq !== assetSeq) return;                                    // 그 사이 다른 문서로 재렌더됨
+    if (!el.isConnected) continue;
+    if (f) {
+      const url = URL.createObjectURL(f);
+      blobUrls.push(url);
+      if (f.type === "image/svg+xml" || /\.svg$/i.test(rel)) el.classList.add("inline-svg");   // 다크 모드 가독성
+      el.src = url;
+    } else missing++;
+  }
+  if (missing && seq === assetSeq) els.assetBar.hidden = false;      // 일부 못 찾음 → 다른 폴더 연결 재시도 유도
+}
+
+async function connectAssetDir() {
+  const t = active();
+  if (!t) return;
+  if (t.dirHandle) {                                                 // 복원된 핸들 → 권한 재허용부터 시도
+    try {
+      const q = t.dirHandle.queryPermission ? await t.dirHandle.queryPermission({ mode: "read" }) : "granted";
+      if (q !== "granted" && t.dirHandle.requestPermission && await t.dirHandle.requestPermission({ mode: "read" }) === "granted") { render(); return; }
+    } catch (e) {}
+  }
+  if (window.showDirectoryPicker) {
+    try {
+      t.dirHandle = await showDirectoryPicker();
+      t.dirFiles = null;
+      putDirHandle(t.id, t.dirHandle);
+      render();
+    } catch (e) { if (e.name !== "AbortError") console.error(e); }
+  } else {
+    els.dirInput.click();                                            // File System Access 미지원 → webkitdirectory
+  }
+}
+
 /* ───────────── 탭 조작 ───────────── */
-async function addTab(name, raw, handle, lastModified) {
+async function addTab(name, raw, handle, lastModified, dirHandle) {
   // 중복 열기 방지: 같은 핸들(우선) 또는 같은 이름의 '깨끗한' 탭이 있으면 재사용
   let existing = null;
   if (handle && handle.isSameEntry) {
@@ -476,13 +552,15 @@ async function addTab(name, raw, handle, lastModified) {
     if (!isDirty(existing)) { existing.raw = raw; existing.savedRaw = raw; existing.externalChanged = false; }   // 미저장 편집은 보존
     else if (raw !== existing.raw) existing.externalChanged = true;            // 편집본과 디스크가 다르면 충돌 알림
     if (handle) { existing.handle = handle; existing.lastModified = lastModified ?? existing.lastModified; putHandle(existing.id, handle); watchHandle(handle); }
+    if (dirHandle) { existing.dirHandle = dirHandle; existing.dirFiles = null; putDirHandle(existing.id, dirHandle); }
     activeId = existing.id;
     saveSession();
     render();
     return;
   }
-  const t = { id: uid(), name, raw, savedRaw: raw, mode: "view", scrollTop: 0, selStart: 0, selEnd: 0, editorScroll: 0, handle: handle || null, lastModified: handle ? (lastModified ?? null) : null, externalChanged: false };
+  const t = { id: uid(), name, raw, savedRaw: raw, mode: "view", scrollTop: 0, selStart: 0, selEnd: 0, editorScroll: 0, handle: handle || null, lastModified: handle ? (lastModified ?? null) : null, externalChanged: false, dirHandle: dirHandle || null, dirFiles: null };
   if (handle) { putHandle(t.id, handle); watchHandle(handle); }
+  if (dirHandle) putDirHandle(t.id, dirHandle);
   tabs.push(t);
   activeId = t.id;
   saveSession();
@@ -600,7 +678,15 @@ async function openFromDrop(dt) {
     for (const it of items) {
       if (it.kind !== "file") continue;
       const h = await it.getAsFileSystemHandle();
-      if (!h || h.kind !== "file") continue;        // 폴더(directory)는 건너뜀
+      if (!h) continue;
+      if (h.kind === "directory") {                 // 폴더 드롭: 안의 문서를 열고, 이미지 해석용으로 그 폴더를 자동 연결
+        for await (const entry of h.values()) {
+          if (entry.kind !== "file") continue;
+          const f = await entry.getFile();
+          if (acceptable(f)) await addTab(f.name, await f.text(), entry, f.lastModified, h);
+        }
+        continue;
+      }
       const f = await h.getFile();
       if (acceptable(f)) await addTab(f.name, await f.text(), h, f.lastModified);
     }
@@ -608,8 +694,8 @@ async function openFromDrop(dt) {
     await openFileList(dt.files);
   }
   if (tabs.length === before) {
-    console.warn("드롭한 항목에서 열 수 있는 파일을 찾지 못했습니다 (폴더는 미지원).");
-    flashEmptyHint("열 수 있는 마크다운/텍스트 파일이 없어요 (폴더 미지원)");
+    console.warn("드롭한 항목에서 열 수 있는 파일을 찾지 못했습니다.");
+    flashEmptyHint("열 수 있는 마크다운/텍스트 파일이 없어요");
   }
 }
 
@@ -726,18 +812,23 @@ function idbStore(mode) {
 }
 const idbReq = r => new Promise((res, rej) => { r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
 const putHandle = (id, h) => idbStore("readwrite").then(s => idbReq(s.put(h, id))).catch(() => {});
-const delHandle = id => idbStore("readwrite").then(s => idbReq(s.delete(id))).catch(() => {});
+const putDirHandle = (id, h) => idbStore("readwrite").then(s => idbReq(s.put(h, "d:" + id))).catch(() => {});   // 이미지 폴더 핸들은 "d:" 접두어로 구분
+const delHandle = id => idbStore("readwrite").then(s => { s.delete(id); s.delete("d:" + id); }).catch(() => {});
 async function restoreHandles() {
   try {
     const s = await idbStore("readonly");
     const [keys, vals] = await Promise.all([idbReq(s.getAllKeys()), idbReq(s.getAll())]);
     const stale = [];
+    let restoredDir = false;
     keys.forEach((k, i) => {
-      const t = tabs.find(t => t.id === k);
-      if (t && vals[i] && vals[i].kind === "file") { t.handle = vals[i]; watchHandle(t.handle); }
+      const isDir = typeof k === "string" && k.startsWith("d:");
+      const t = tabs.find(t => t.id === (isDir ? k.slice(2) : k));
+      if (t && vals[i] && isDir && vals[i].kind === "directory") { t.dirHandle = vals[i]; restoredDir = true; }
+      else if (t && vals[i] && !isDir && vals[i].kind === "file") { t.handle = vals[i]; watchHandle(t.handle); }
       else stale.push(k);                            // 닫힌 탭의 핸들은 정리
     });
     if (stale.length) { const w = await idbStore("readwrite"); stale.forEach(k => w.delete(k)); }
+    if (restoredDir && active()) render();           // 복원된 폴더로 로컬 이미지 다시 해석
     checkExternal();                                 // 복원 직후 디스크와 즉시 대조 (권한 없으면 조용히 건너뜀)
   } catch (e) { /* IndexedDB 불가(file:// 등) → 다운로드 저장으로 폴백 */ }
 }
@@ -760,7 +851,7 @@ function loadSession() {
   try {
     const data = JSON.parse(localStorage.getItem(SESSION_KEY) || "null");
     if (!data || !data.tabs || !data.tabs.length) return false;
-    tabs = data.tabs.map(t => ({ scrollTop: 0, selStart: 0, selEnd: 0, editorScroll: 0, ...t, handle: null, lastModified: null, externalChanged: false }));
+    tabs = data.tabs.map(t => ({ scrollTop: 0, selStart: 0, selEnd: 0, editorScroll: 0, ...t, handle: null, lastModified: null, externalChanged: false, dirHandle: null, dirFiles: null }));
     activeId = tabs.some(t => t.id === data.activeId) ? data.activeId : tabs[0].id;
     restoreHandles();                                // 비동기 — 핸들은 잠시 뒤 재연결됨
     return true;
@@ -770,6 +861,18 @@ function loadSession() {
 /* ───────────── 이벤트 ───────────── */
 els.openBtn.onclick = openViaPicker;
 els.fileInput.onchange = e => { openFileList(e.target.files); e.target.value = ""; };
+els.assetPick.onclick = connectAssetDir;
+els.dirInput.onchange = e => {                       // webkitdirectory 폴백: 경로→File 맵으로 해석 (세션 동안만 유지)
+  const t = active();
+  if (t && e.target.files.length) {
+    const map = new Map();
+    for (const f of e.target.files) map.set((f.webkitRelativePath || f.name).split("/").slice(1).join("/"), f);
+    t.dirFiles = map;
+    t.dirHandle = null;
+    render();
+  }
+  e.target.value = "";
+};
 els.segView.onclick = () => setMode("view");
 els.segEdit.onclick = () => setMode("edit");
 
