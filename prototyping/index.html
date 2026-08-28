@@ -220,6 +220,9 @@
   #content pre.mermaid svg { max-width: 100%; height: auto; }
   #content pre.mermaid[data-error] { border-left: 3px solid var(--accent); }
   #content pre.mermaid[data-error]::before { content: "다이어그램 문법 오류 — 원본을 표시합니다"; display: block; margin-bottom: 10px; font-family: Pretendard, -apple-system, "Segoe UI", "Malgun Gothic", sans-serif; font-size: 12px; color: var(--accent); }
+
+  /* SVG 이미지(인라인 <svg> 블록·data URI) — 투명 배경 + 어두운 선 그림이 다크 모드에서 안 보이지 않도록 밝은 배경 위에 표시 */
+  #content img.inline-svg, #content img[src^="data:image/svg"] { background: #fff; padding: 8px; }
 </style>
 </head>
 <body>
@@ -260,6 +263,8 @@
 function md(src) {
   const esc = s => s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;");
   const safeUrl = u => /^\s*(javascript|data|vbscript):/i.test(u) ? "#" : u;   // 위험 스킴 차단
+  // 이미지 src만 data:image/* 허용 — <img>는 스크립트가 실행되지 않는 이미지 컨텍스트라 안전 (내장 SVG/PNG 등)
+  const safeImgUrl = u => /^\s*data:image\//i.test(u) ? u : safeUrl(u);
   src = src.replace(/\u0000/g, "");                                            // 센티넬 주입 방지
 
   // 펜스 코드블록: 줄 시작/끝 앵커, 비출력 센티넬로 분리
@@ -271,12 +276,19 @@ function md(src) {
     return `\u0000B${blocks.length - 1}\u0000`;
   });
 
+  // 독립된 <svg>…</svg> 블록: <img> data URL(스크립트가 실행되지 않는 이미지 컨텍스트)로 안전하게 렌더
+  src = src.replace(/^<svg[\s>][\s\S]*?<\/svg>\s*$/gim, svg => {
+    if (!/^<svg[^>]*\sxmlns\s*=/i.test(svg)) svg = svg.replace(/^<svg/i, '<svg xmlns="http://www.w3.org/2000/svg"');   // xmlns 없으면 <img>가 못 그림
+    blocks.push(`<img class="inline-svg" alt="SVG 다이어그램" src="data:image/svg+xml,${encodeURIComponent(svg)}">`);
+    return `\u0000B${blocks.length - 1}\u0000`;
+  });
+
   const inline = s => {
     const codes = [];
     // 인라인 코드 먼저 추출(강조/링크 치환에 안 깨지도록), 내용은 즉시 이스케이프
     s = s.replace(/`([^`]+)`/g, (_, c) => { codes.push(`<code>${esc(c)}</code>`); return `\u0000C${codes.length - 1}\u0000`; });
     return esc(s)
-      .replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (_, a, u) => `<img alt="${a}" src="${safeUrl(u)}">`)
+      .replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (_, a, u) => `<img alt="${a}" src="${safeImgUrl(u)}">`)
       .replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, t, u) => `<a href="${safeUrl(u)}" target="_blank" rel="noopener">${t}</a>`)
       .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
       .replace(/\*([^*]+)\*/g, "<em>$1</em>")
